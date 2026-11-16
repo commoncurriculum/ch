@@ -54,11 +54,17 @@ defmodule Ch.TelemetryTest do
              query: %Ch.Query{statement: "select {a:UInt8}", command: :select},
              database: database,
              hostname: "localhost",
-             port: 8123
+             port: 8123,
+             source: nil
            } = start_metadata
 
     assert database == Ch.Test.database()
     assert stop_metadata == Map.put(start_metadata, :error, nil)
+  end
+
+  test "the query's source option is in the metadata", %{conn: conn} do
+    assert {:ok, _} = Ch.query(conn, "select 1", [], source: "events")
+    assert_receive {:telemetry, [:ch, :query, :stop], _, %{source: "events"}}
   end
 
   test "the database passed to the query wins over the connection's", %{conn: conn} do

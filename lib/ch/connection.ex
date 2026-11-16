@@ -119,7 +119,16 @@ defmodule Ch.Connection do
 
   @impl true
   def handle_declare(query, params, opts, conn) do
-    span(query, opts, conn, fn -> declare(query, params, opts, conn) end)
+    telemetry = telemetry_start(query, opts, conn)
+
+    case with_telemetry(telemetry, fn -> declare(query, params, opts, conn) end) do
+      {:ok, query, result, {conn, reader}} ->
+        {:ok, query, result, {HTTP.put_private(conn, :telemetry, telemetry), reader}}
+
+      {_error, reason, _conn} = error ->
+        telemetry_stop(telemetry, reason)
+        error
+    end
   end
 
   defp declare(query, params, opts, conn) do
@@ -227,7 +236,16 @@ defmodule Ch.Connection do
   defp maybe_concat_buffer([], data), do: data
 
   @impl true
-  def handle_fetch(query, %Result{} = result, opts, {conn, reader}) do
+  def handle_fetch(query, %Result{} = result, opts, {conn, _reader} = state) do
+    case with_telemetry(HTTP.get_private(conn, :telemetry), fn ->
+           fetch(query, result, opts, state)
+         end) do
+      {:disconnect, reason, conn} -> {:disconnect, reason, telemetry_finish(conn, reason)}
+      other -> other
+    end
+  end
+
+  defp fetch(query, %Result{} = result, opts, {conn, reader}) do
     case reader do
       %{responses: []} ->
         handle_fetch_recv(query, result, opts, conn, reader)
@@ -266,7 +284,7 @@ defmodule Ch.Connection do
     case HTTP.recv(conn, 0, timeout) do
       {:ok, conn, responses} ->
         reader = %{reader | responses: responses}
-        handle_fetch(query, result, opts, {conn, reader})
+        fetch(query, result, opts, {conn, reader})
 
       {:error, conn, reason, _responses} ->
         {:disconnect, reason, conn}
@@ -277,49 +295,104 @@ defmodule Ch.Connection do
   def handle_deallocate(_query, %Result{} = result, _opts, {conn, _reader}) do
     case HTTP.open_request_count(conn) do
       0 ->
-        {:ok, %{result | data: []}, conn}
+        {:ok, %{result | data: []}, telemetry_finish(conn, nil)}
 
       1 ->
         error =
           Error.exception("stopping stream before receiving full response by closing connection")
 
-        {:disconnect, error, conn}
+        {:disconnect, error, telemetry_finish(conn, error)}
     end
   end
 
   @impl true
   def handle_execute(query, {:stream, _params} = params, opts, conn) do
-    execute(query, params, opts, conn)
+    telemetry = telemetry_start(query, opts, conn)
+
+    case with_telemetry(telemetry, fn -> execute(query, params, opts, conn) end) do
+      {:ok, query, ref, conn} ->
+        {:ok, query, ref, HTTP.put_private(conn, :telemetry, telemetry)}
+
+      {_error, reason, _conn} = error ->
+        telemetry_stop(telemetry, reason)
+        error
+    end
   end
 
-  def handle_execute(query, {:stream, _ref, _body} = params, opts, conn) do
-    execute(query, params, opts, conn)
+  def handle_execute(query, {:stream, _ref, body} = params, opts, conn) do
+    case with_telemetry(HTTP.get_private(conn, :telemetry), fn ->
+           execute(query, params, opts, conn)
+         end) do
+      {:ok, query, responses, conn} when body == :eof ->
+        {:ok, query, responses, telemetry_finish(conn, nil)}
+
+      {:ok, _query, _ref, _conn} = ok ->
+        ok
+
+      {error, reason, conn} ->
+        {error, reason, telemetry_finish(conn, reason)}
+    end
   end
 
   def handle_execute(query, params, opts, conn) do
-    span(query, opts, conn, fn -> execute(query, params, opts, conn) end)
+    telemetry = telemetry_start(query, opts, conn)
+    result = with_telemetry(telemetry, fn -> execute(query, params, opts, conn) end)
+
+    case result do
+      {:ok, _query, _responses, _conn} -> telemetry_stop(telemetry, nil)
+      {_error, reason, _conn} -> telemetry_stop(telemetry, reason)
+    end
+
+    result
   end
 
-  defp span(query, opts, conn, fun) do
+  defp telemetry_start(query, opts, conn) do
     metadata = %{
       query: query,
       database: get_opts_or_private(conn, opts, :database),
       hostname: HTTP.get_private(conn, :hostname),
       port: HTTP.get_private(conn, :port),
-      source: Keyword.get(opts, :source)
+      source: Keyword.get(opts, :source),
+      telemetry_span_context: make_ref()
     }
 
-    :telemetry.span([:ch, :query], metadata, fn ->
-      result = fun.()
+    start_time = System.monotonic_time()
+    measurements = %{system_time: System.system_time(), monotonic_time: start_time}
+    :telemetry.execute([:ch, :query, :start], measurements, metadata)
+    {start_time, metadata}
+  end
 
-      error =
-        case result do
-          {:ok, _query, _result, _state} -> nil
-          {_error, reason, _conn} -> reason
-        end
+  defp telemetry_stop({start_time, metadata}, error) do
+    stop_time = System.monotonic_time()
+    measurements = %{duration: stop_time - start_time, monotonic_time: stop_time}
+    :telemetry.execute([:ch, :query, :stop], measurements, Map.put(metadata, :error, error))
+  end
 
-      {result, Map.put(metadata, :error, error)}
-    end)
+  defp telemetry_finish(conn, error) do
+    case HTTP.get_private(conn, :telemetry) do
+      nil ->
+        conn
+
+      telemetry ->
+        telemetry_stop(telemetry, error)
+        HTTP.delete_private(conn, :telemetry)
+    end
+  end
+
+  defp with_telemetry(nil, fun), do: fun.()
+
+  defp with_telemetry({start_time, metadata}, fun) do
+    fun.()
+  catch
+    kind, reason ->
+      stop_time = System.monotonic_time()
+      measurements = %{duration: stop_time - start_time, monotonic_time: stop_time}
+
+      metadata =
+        Map.merge(metadata, %{kind: kind, reason: reason, stacktrace: __STACKTRACE__})
+
+      :telemetry.execute([:ch, :query, :exception], measurements, metadata)
+      :erlang.raise(kind, reason, __STACKTRACE__)
   end
 
   defp execute(%Query{} = query, {:stream, params}, opts, conn) do

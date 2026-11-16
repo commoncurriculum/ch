@@ -203,9 +203,11 @@ settings = [async_insert: 1]
 
 #### Telemetry
 
-Every query, from `Ch.query/4`, `Ch.stream/4` or Ecto, emits `[:ch, :query, :start]` and then `[:ch, :query, :stop]` (or `[:ch, :query, :exception]` if it raises) in the calling process, through `:telemetry.span/3`.
+Every query, from `Ch.query/4`, `Ch.stream/4` or Ecto, emits `[:ch, :query, :start]` and then `[:ch, :query, :stop]` (or `[:ch, :query, :exception]` if it raises) in the calling process. The events follow `:telemetry.span/3`'s measurements and carry a `:telemetry_span_context`.
 
-Metadata: `:query` (the `%Ch.Query{}`), `:database`, `:hostname`, `:port` and `:source`, the query's `:source` option, which Ecto sets to the table. The stop event adds `:error`, the `%Ch.Error{}` or transport error the query returned, or `nil`. For `Ch.stream/4` the span covers the request up to the response headers. Chunked inserts (`Ch.stream/4` used as a collectable) emit nothing.
+Metadata: `:query` (the `%Ch.Query{}`), `:database`, `:hostname`, `:port` and `:source`, the query's `:source` option, which Ecto sets to the table. The stop event adds `:error`, the `%Ch.Error{}` or transport error the query returned, or `nil`.
+
+A `Ch.stream/4` read stops after its last row is fetched, or when the stream is stopped early. A `Ch.stream/4` insert (used as a collectable) is one query that stops after its last chunk.
 
 ## Caveats
 

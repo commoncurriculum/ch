@@ -38,6 +38,7 @@ defmodule Ch.MixProject do
     [
       {:mint, "~> 1.8"},
       {:db_connection, "~> 2.10.1"},
+      {:telemetry, "~> 1.0"},
       {:jason, "~> 1.0"},
       {:decimal, "~> 3.0"},
       {:ecto, "~> 3.14.0", optional: true},

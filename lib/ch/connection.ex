@@ -21,6 +21,8 @@ defmodule Ch.Connection do
       conn =
         conn
         |> HTTP.put_private(:timeout, opts[:timeout] || :timer.seconds(15))
+        |> HTTP.put_private(:hostname, address)
+        |> HTTP.put_private(:port, port)
         |> maybe_put_private(:database, opts[:database])
         |> maybe_put_private(:username, opts[:username])
         |> maybe_put_private(:password, opts[:password])
@@ -29,7 +31,7 @@ defmodule Ch.Connection do
       handshake = Query.build("select 1, version()")
       params = DBConnection.Query.encode(handshake, _params = [], _opts = [])
 
-      case handle_execute(handshake, params, _opts = [], conn) do
+      case execute(handshake, params, _opts = [], conn) do
         {:ok, handshake, responses, conn} ->
           case DBConnection.Query.decode(handshake, responses, _opts = []) do
             %Result{rows: [[1, version]]} ->
@@ -117,6 +119,10 @@ defmodule Ch.Connection do
 
   @impl true
   def handle_declare(query, params, opts, conn) do
+    span(query, opts, conn, fn -> declare(query, params, opts, conn) end)
+  end
+
+  defp declare(query, params, opts, conn) do
     %Query{command: command, decode: decode} = query
     {query_params, extra_headers, body} = params
 
@@ -282,7 +288,40 @@ defmodule Ch.Connection do
   end
 
   @impl true
-  def handle_execute(%Query{} = query, {:stream, params}, opts, conn) do
+  def handle_execute(query, {:stream, _params} = params, opts, conn) do
+    execute(query, params, opts, conn)
+  end
+
+  def handle_execute(query, {:stream, _ref, _body} = params, opts, conn) do
+    execute(query, params, opts, conn)
+  end
+
+  def handle_execute(query, params, opts, conn) do
+    span(query, opts, conn, fn -> execute(query, params, opts, conn) end)
+  end
+
+  defp span(query, opts, conn, fun) do
+    metadata = %{
+      query: query,
+      database: get_opts_or_private(conn, opts, :database),
+      hostname: HTTP.get_private(conn, :hostname),
+      port: HTTP.get_private(conn, :port)
+    }
+
+    :telemetry.span([:ch, :query], metadata, fn ->
+      result = fun.()
+
+      error =
+        case result do
+          {:ok, _query, _result, _state} -> nil
+          {_error, reason, _conn} -> reason
+        end
+
+      {result, Map.put(metadata, :error, error)}
+    end)
+  end
+
+  defp execute(%Query{} = query, {:stream, params}, opts, conn) do
     {query_params, extra_headers, body} = params
 
     path = path(conn, query_params, opts)
@@ -296,7 +335,7 @@ defmodule Ch.Connection do
     end
   end
 
-  def handle_execute(%Query{} = query, {:stream, ref, body}, opts, conn) do
+  defp execute(%Query{} = query, {:stream, ref, body}, opts, conn) do
     case HTTP.stream_request_body(conn, ref, body) do
       {:ok, conn} ->
         case body do
@@ -314,7 +353,7 @@ defmodule Ch.Connection do
     end
   end
 
-  def handle_execute(%Query{command: :insert} = query, params, opts, conn) do
+  defp execute(%Query{command: :insert} = query, params, opts, conn) do
     {query_params, extra_headers, body} = params
 
     path = path(conn, query_params, opts)
@@ -334,7 +373,7 @@ defmodule Ch.Connection do
     end
   end
 
-  def handle_execute(query, params, opts, conn) do
+  defp execute(query, params, opts, conn) do
     {query_params, extra_headers, body} = params
 
     path = path(conn, query_params, opts)

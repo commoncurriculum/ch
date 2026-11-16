@@ -305,7 +305,8 @@ defmodule Ch.Connection do
       query: query,
       database: get_opts_or_private(conn, opts, :database),
       hostname: HTTP.get_private(conn, :hostname),
-      port: HTTP.get_private(conn, :port)
+      port: HTTP.get_private(conn, :port),
+      source: Keyword.get(opts, :source)
     }
 
     :telemetry.span([:ch, :query], metadata, fn ->

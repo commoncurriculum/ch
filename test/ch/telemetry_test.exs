@@ -214,6 +214,63 @@ defmodule Ch.TelemetryTest do
     assert_receive {:telemetry, [:ch, :query, :stop], _, %{error: %Ch.Error{code: 62}}}
   end
 
+  def send_from_any_process(event, _measurements, metadata, test) do
+    send(test, {:ended, List.last(event), metadata.telemetry_span_context, metadata})
+  end
+
+  defp attach_from_any_process(test) do
+    handler_id = make_ref()
+
+    :telemetry.attach_many(
+      handler_id,
+      [[:ch, :query, :stop], [:ch, :query, :exception]],
+      &__MODULE__.send_from_any_process/4,
+      self()
+    )
+
+    on_exit(fn -> :telemetry.detach(handler_id) end)
+    test
+  end
+
+  test "a stream whose checkout times out is stopped once, by the pool, with the error" do
+    attach_from_any_process(self())
+    conn = start_supervised!({Ch, database: Ch.Test.database(), pool_size: 1}, id: :timeout)
+
+    assert_raise DBConnection.ConnectionError, fn ->
+      DBConnection.run(
+        conn,
+        fn conn ->
+          conn
+          |> Ch.stream("select number from numbers(5000000) settings max_block_size=1000")
+          |> Stream.each(fn _ -> Process.sleep(50) end)
+          |> Stream.run()
+        end,
+        timeout: 300
+      )
+    end
+
+    assert_receive {:telemetry, [:ch, :query, :start], _, %{telemetry_span_context: ref}}
+
+    assert_receive {:ended, :stop, ^ref, %{error: %DBConnection.ConnectionError{}}}, 1_000
+    refute_receive {:ended, _, ^ref, _}, 200
+  end
+
+  test "a stream that raises ends once, with the exception", %{conn: conn} do
+    attach_from_any_process(self())
+
+    assert_raise ArgumentError, fn ->
+      DBConnection.run(conn, fn conn ->
+        conn
+        |> Ch.stream("select toIntervalDay(1)")
+        |> Enum.into([])
+      end)
+    end
+
+    assert_receive {:telemetry, [:ch, :query, :start], _, %{telemetry_span_context: ref}}
+    assert_receive {:ended, :exception, ^ref, _}
+    refute_receive {:ended, _, ^ref, _}, 200
+  end
+
   test "a connection error is reported on stop", %{conn: conn} do
     assert {:error, %Mint.TransportError{}} = Ch.query(conn, "select sleep(1)", [], timeout: 100)
 

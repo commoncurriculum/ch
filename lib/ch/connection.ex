@@ -455,7 +455,8 @@ defmodule Ch.Connection do
     disconnect(error, conn)
   end
 
-  def disconnect(_error, conn) do
+  def disconnect(error, conn) do
+    conn = telemetry_finish(conn, error)
     {:ok = ok, _conn} = HTTP.close(conn)
     ok
   end

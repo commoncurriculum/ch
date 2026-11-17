@@ -2,7 +2,7 @@ defmodule Ch.Connection do
   @moduledoc false
   use DBConnection
   require Logger
-  alias Ch.{Error, Query, Result, RowBinary}
+  alias Ch.{Error, Query, Result, RowBinary, Telemetry}
   alias Mint.HTTP1, as: HTTP
 
   @user_agent "ch/" <> Mix.Project.config()[:version]
@@ -121,12 +121,12 @@ defmodule Ch.Connection do
   def handle_declare(query, params, opts, conn) do
     telemetry = telemetry_start(query, opts, conn)
 
-    case with_telemetry(telemetry, fn -> declare(query, params, opts, conn) end) do
+    case Telemetry.run(telemetry, fn -> declare(query, params, opts, conn) end) do
       {:ok, query, result, {conn, reader}} ->
         {:ok, query, result, {HTTP.put_private(conn, :telemetry, telemetry), reader}}
 
       {_error, reason, _conn} = error ->
-        telemetry_stop(telemetry, reason)
+        Telemetry.stop(telemetry, reason)
         error
     end
   end
@@ -237,11 +237,17 @@ defmodule Ch.Connection do
 
   @impl true
   def handle_fetch(query, %Result{} = result, opts, {conn, _reader} = state) do
-    case with_telemetry(HTTP.get_private(conn, :telemetry), fn ->
+    case Telemetry.run(HTTP.get_private(conn, :telemetry), fn ->
            fetch(query, result, opts, state)
          end) do
-      {:disconnect, reason, conn} -> {:disconnect, reason, telemetry_finish(conn, reason)}
-      other -> other
+      {:cont, %Result{num_rows: num_rows} = result, {conn, reader}} ->
+        {:cont, result, {telemetry_add_rows(conn, num_rows), reader}}
+
+      {:disconnect, reason, conn} ->
+        {:disconnect, reason, telemetry_finish(conn, reason)}
+
+      other ->
+        other
     end
   end
 
@@ -309,22 +315,23 @@ defmodule Ch.Connection do
   def handle_execute(query, {:stream, _params} = params, opts, conn) do
     telemetry = telemetry_start(query, opts, conn)
 
-    case with_telemetry(telemetry, fn -> execute(query, params, opts, conn) end) do
+    case Telemetry.run(telemetry, fn -> execute(query, params, opts, conn) end) do
       {:ok, query, ref, conn} ->
         {:ok, query, ref, HTTP.put_private(conn, :telemetry, telemetry)}
 
       {_error, reason, _conn} = error ->
-        telemetry_stop(telemetry, reason)
+        Telemetry.stop(telemetry, reason)
         error
     end
   end
 
   def handle_execute(query, {:stream, _ref, body} = params, opts, conn) do
-    case with_telemetry(HTTP.get_private(conn, :telemetry), fn ->
-           execute(query, params, opts, conn)
-         end) do
+    telemetry = HTTP.get_private(conn, :telemetry)
+
+    case Telemetry.run(telemetry, fn -> execute(query, params, opts, conn) end) do
       {:ok, query, responses, conn} when body == :eof ->
-        {:ok, query, responses, telemetry_finish(conn, nil)}
+        {:ok, query, decode_with_telemetry(telemetry, responses),
+         HTTP.delete_private(conn, :telemetry)}
 
       {:ok, _query, _ref, _conn} = ok ->
         ok
@@ -336,36 +343,35 @@ defmodule Ch.Connection do
 
   def handle_execute(query, params, opts, conn) do
     telemetry = telemetry_start(query, opts, conn)
-    result = with_telemetry(telemetry, fn -> execute(query, params, opts, conn) end)
 
-    case result do
-      {:ok, _query, _responses, _conn} -> telemetry_stop(telemetry, nil)
-      {_error, reason, _conn} -> telemetry_stop(telemetry, reason)
+    case Telemetry.run(telemetry, fn -> execute(query, params, opts, conn) end) do
+      {:ok, query, responses, conn} ->
+        {:ok, query, decode_with_telemetry(telemetry, responses), conn}
+
+      {_error, reason, _conn} = error ->
+        Telemetry.stop(telemetry, reason)
+        error
     end
-
-    result
   end
 
+  defp decode_with_telemetry(nil, responses), do: responses
+  defp decode_with_telemetry(telemetry, responses), do: {Telemetry, telemetry, responses}
+
   defp telemetry_start(query, opts, conn) do
-    metadata = %{
+    Telemetry.start(%{
       query: query,
       database: get_opts_or_private(conn, opts, :database),
       hostname: HTTP.get_private(conn, :hostname),
       port: HTTP.get_private(conn, :port),
-      source: Keyword.get(opts, :source),
-      telemetry_span_context: make_ref()
-    }
-
-    start_time = System.monotonic_time()
-    measurements = %{system_time: System.system_time(), monotonic_time: start_time}
-    :telemetry.execute([:ch, :query, :start], measurements, metadata)
-    {start_time, metadata}
+      source: Keyword.get(opts, :source)
+    })
   end
 
-  defp telemetry_stop({start_time, metadata}, error) do
-    stop_time = System.monotonic_time()
-    measurements = %{duration: stop_time - start_time, monotonic_time: stop_time}
-    :telemetry.execute([:ch, :query, :stop], measurements, Map.put(metadata, :error, error))
+  defp telemetry_add_rows(conn, num_rows) do
+    case HTTP.get_private(conn, :telemetry) do
+      nil -> conn
+      telemetry -> HTTP.put_private(conn, :telemetry, Telemetry.add_rows(telemetry, num_rows))
+    end
   end
 
   defp telemetry_finish(conn, error) do
@@ -374,25 +380,9 @@ defmodule Ch.Connection do
         conn
 
       telemetry ->
-        telemetry_stop(telemetry, error)
+        Telemetry.stop(telemetry, error)
         HTTP.delete_private(conn, :telemetry)
     end
-  end
-
-  defp with_telemetry(nil, fun), do: fun.()
-
-  defp with_telemetry({start_time, metadata}, fun) do
-    fun.()
-  catch
-    kind, reason ->
-      stop_time = System.monotonic_time()
-      measurements = %{duration: stop_time - start_time, monotonic_time: stop_time}
-
-      metadata =
-        Map.merge(metadata, %{kind: kind, reason: reason, stacktrace: __STACKTRACE__})
-
-      :telemetry.execute([:ch, :query, :exception], measurements, metadata)
-      :erlang.raise(kind, reason, __STACKTRACE__)
   end
 
   defp execute(%Query{} = query, {:stream, params}, opts, conn) do

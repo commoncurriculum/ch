@@ -240,6 +240,9 @@ defmodule Ch.Connection do
     case Telemetry.run(HTTP.get_private(conn, :telemetry), fn ->
            fetch(query, result, opts, state)
          end) do
+      {:cont, result, {conn, %{decode: false} = reader}} ->
+        {:cont, result, {conn, reader}}
+
       {:cont, %Result{num_rows: num_rows} = result, {conn, reader}} ->
         {:cont, result, {telemetry_add_rows(conn, num_rows), reader}}
 
@@ -307,7 +310,7 @@ defmodule Ch.Connection do
         error =
           Error.exception("stopping stream before receiving full response by closing connection")
 
-        {:disconnect, error, telemetry_finish(conn, error)}
+        {:disconnect, error, telemetry_finish(conn, nil)}
     end
   end
 
@@ -325,13 +328,17 @@ defmodule Ch.Connection do
     end
   end
 
+  def handle_execute(_query, {:stream, _ref, :halt}, _opts, conn) do
+    error = Error.exception("stopping insert stream before its last chunk by closing connection")
+    {:disconnect, error, telemetry_finish(conn, error)}
+  end
+
   def handle_execute(query, {:stream, _ref, body} = params, opts, conn) do
     telemetry = HTTP.get_private(conn, :telemetry)
 
     case Telemetry.run(telemetry, fn -> execute(query, params, opts, conn) end) do
       {:ok, query, responses, conn} when body == :eof ->
-        {:ok, query, decode_with_telemetry(telemetry, responses),
-         HTTP.delete_private(conn, :telemetry)}
+        {:ok, query, {Telemetry, telemetry, responses}, HTTP.delete_private(conn, :telemetry)}
 
       {:ok, _query, _ref, _conn} = ok ->
         ok
@@ -346,16 +353,13 @@ defmodule Ch.Connection do
 
     case Telemetry.run(telemetry, fn -> execute(query, params, opts, conn) end) do
       {:ok, query, responses, conn} ->
-        {:ok, query, decode_with_telemetry(telemetry, responses), conn}
+        {:ok, query, {Telemetry, telemetry, responses}, conn}
 
       {_error, reason, _conn} = error ->
         Telemetry.stop(telemetry, reason)
         error
     end
   end
-
-  defp decode_with_telemetry(nil, responses), do: responses
-  defp decode_with_telemetry(telemetry, responses), do: {Telemetry, telemetry, responses}
 
   defp telemetry_start(query, opts, conn) do
     Telemetry.start(%{
@@ -368,10 +372,8 @@ defmodule Ch.Connection do
   end
 
   defp telemetry_add_rows(conn, num_rows) do
-    case HTTP.get_private(conn, :telemetry) do
-      nil -> conn
-      telemetry -> HTTP.put_private(conn, :telemetry, Telemetry.add_rows(telemetry, num_rows))
-    end
+    telemetry = HTTP.get_private(conn, :telemetry)
+    HTTP.put_private(conn, :telemetry, Telemetry.add_rows(telemetry, num_rows))
   end
 
   defp telemetry_finish(conn, error) do

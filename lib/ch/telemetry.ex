@@ -21,15 +21,8 @@ defmodule Ch.Telemetry do
   end
 
   @spec stop(t, term) :: :ok
-  def stop(%{start_time: start_time, metadata: metadata, num_rows: num_rows} = telemetry, error) do
-    if end_once(telemetry) do
-      stop_time = System.monotonic_time()
-      measurements = %{duration: stop_time - start_time, monotonic_time: stop_time}
-      metadata = Map.merge(metadata, %{error: error, num_rows: num_rows})
-      :telemetry.execute([:ch, :query, :stop], measurements, metadata)
-    end
-
-    :ok
+  def stop(%{num_rows: num_rows} = telemetry, error) do
+    emit_end(telemetry, :stop, %{error: error, num_rows: num_rows})
   end
 
   @spec add_rows(t, non_neg_integer | nil) :: t
@@ -39,22 +32,22 @@ defmodule Ch.Telemetry do
   def add_rows(%{num_rows: num_rows} = telemetry, rows),
     do: %{telemetry | num_rows: num_rows + rows}
 
-  @spec run(t | nil, (-> result)) :: result when result: var
-  def run(nil, fun), do: fun.()
-
-  def run(%{start_time: start_time, metadata: metadata} = telemetry, fun) do
+  @spec run(t, (-> result)) :: result when result: var
+  def run(telemetry, fun) do
     fun.()
   catch
     kind, reason ->
-      if end_once(telemetry) do
-        stop_time = System.monotonic_time()
-        measurements = %{duration: stop_time - start_time, monotonic_time: stop_time}
-        metadata = Map.merge(metadata, %{kind: kind, reason: reason, stacktrace: __STACKTRACE__})
-        :telemetry.execute([:ch, :query, :exception], measurements, metadata)
-      end
-
+      emit_end(telemetry, :exception, %{kind: kind, reason: reason, stacktrace: __STACKTRACE__})
       :erlang.raise(kind, reason, __STACKTRACE__)
   end
 
-  defp end_once(%{ended: ended}), do: :atomics.compare_exchange(ended, 1, 0, 1) == :ok
+  defp emit_end(%{start_time: start_time, metadata: metadata, ended: ended}, event, extra) do
+    if :atomics.compare_exchange(ended, 1, 0, 1) == :ok do
+      stop_time = System.monotonic_time()
+      measurements = %{duration: stop_time - start_time, monotonic_time: stop_time}
+      :telemetry.execute([:ch, :query, event], measurements, Map.merge(metadata, extra))
+    end
+
+    :ok
+  end
 end

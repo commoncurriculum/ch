@@ -85,9 +85,14 @@ defmodule Ch.Connection do
     headers = [{"user-agent", @user_agent}]
 
     case request(conn, "GET", "/ping", headers, _body = "", _opts = []) do
-      {:ok, conn, _response} -> {:ok, conn}
-      {:error, error, conn} -> {:disconnect, error, conn}
-      {:disconnect, _error, _conn} = disconnect -> disconnect
+      {:ok, conn, _response} ->
+        {:ok, conn}
+
+      {:error, error, conn} ->
+        {:disconnect, error, conn}
+
+      {disconnect, error, conn} when disconnect in [:disconnect, :disconnect_and_retry] ->
+        {:disconnect, error, conn}
     end
   end
 
@@ -152,8 +157,12 @@ defmodule Ch.Connection do
 
       {:ok, query, result, {conn, reader}}
     else
-      {:error, _reason, _conn} = client_error -> client_error
-      {:disconnect, reason, conn} -> {:disconnect_and_retry, reason, conn}
+      {:error, _reason, _conn} = client_error ->
+        client_error
+
+      {disconnect, _reason, _conn} = error
+      when disconnect in [:disconnect, :disconnect_and_retry] ->
+        error
     end
   end
 
@@ -396,7 +405,7 @@ defmodule Ch.Connection do
     with {:ok, conn, ref} <- send_request(conn, "POST", path, headers, :stream) do
       case HTTP.stream_request_body(conn, ref, body) do
         {:ok, conn} -> {:ok, query, ref, conn}
-        {:error, conn, reason} -> {:disconnect_and_retry, reason, conn}
+        {:error, conn, reason} -> {:disconnect, reason, conn}
       end
     end
   end
@@ -415,7 +424,7 @@ defmodule Ch.Connection do
         end
 
       {:error, conn, reason} ->
-        {:disconnect_and_retry, reason, conn}
+        {:disconnect, reason, conn}
     end
   end
 
@@ -433,9 +442,15 @@ defmodule Ch.Connection do
       end
 
     case result do
-      {:ok, conn, responses} -> {:ok, query, responses, conn}
-      {:error, _reason, _conn} = client_error -> client_error
-      {:disconnect, reason, conn} -> {:disconnect_and_retry, reason, conn}
+      {:ok, conn, responses} ->
+        {:ok, query, responses, conn}
+
+      {:error, _reason, _conn} = client_error ->
+        client_error
+
+      {disconnect, _reason, _conn} = error
+      when disconnect in [:disconnect, :disconnect_and_retry] ->
+        error
     end
   end
 
@@ -446,9 +461,15 @@ defmodule Ch.Connection do
     headers = headers(conn, extra_headers, opts)
 
     case request(conn, "POST", path, headers, body, opts) do
-      {:ok, conn, responses} -> {:ok, query, responses, conn}
-      {:error, _reason, _conn} = client_error -> client_error
-      {:disconnect, reason, conn} -> {:disconnect_and_retry, reason, conn}
+      {:ok, conn, responses} ->
+        {:ok, query, responses, conn}
+
+      {:error, _reason, _conn} = client_error ->
+        client_error
+
+      {disconnect, _reason, _conn} = error
+      when disconnect in [:disconnect, :disconnect_and_retry] ->
+        error
     end
   end
 
@@ -507,7 +528,7 @@ defmodule Ch.Connection do
   defp send_request(conn, method, path, headers, body) do
     case HTTP.request(conn, method, path, headers, body) do
       {:ok, _conn, _ref} = ok -> ok
-      {:error, conn, reason} -> {:disconnect, reason, conn}
+      {:error, conn, reason} -> {:disconnect_and_retry, reason, conn}
     end
   end
 
@@ -536,7 +557,7 @@ defmodule Ch.Connection do
   end
 
   @spec recv_all(conn, [response], timeout()) ::
-          {:ok, conn, [response]} | {:disconnect, Mint.Types.error(), conn}
+          {:ok, conn, [response]} | {:disconnect, Mint.Types.error() | Error.t(), conn}
   defp recv_all(conn, acc, timeout) do
     case HTTP.recv(conn, 0, timeout) do
       {:ok, conn, responses} ->
@@ -545,8 +566,8 @@ defmodule Ch.Connection do
           {:more, acc} -> recv_all(conn, acc, timeout)
         end
 
-      {:error, conn, reason, _responses} ->
-        {:disconnect, reason, conn}
+      {:error, conn, reason, responses} ->
+        {:disconnect, cut_off_exception(responses, acc) || reason, conn}
     end
   end
 
@@ -562,6 +583,22 @@ defmodule Ch.Connection do
 
   defp handle_all_responses([{:done, _ref}], acc), do: {:ok, :lists.reverse(acc)}
   defp handle_all_responses([], acc), do: {:more, acc}
+
+  defp cut_off_exception(responses, acc) do
+    with {:more, acc} <- handle_all_responses(responses, acc),
+         [200, headers | data] <- :lists.reverse(acc),
+         tag when is_binary(tag) <- get_header(headers, "x-clickhouse-exception-tag"),
+         [_, message, code] <- Regex.run(exception_regex(tag), IO.iodata_to_binary(data)) do
+      Error.exception(code: String.to_integer(code), message: message)
+    else
+      _ -> nil
+    end
+  end
+
+  defp exception_regex(tag) do
+    tag = Regex.escape(tag)
+    ~r/__exception__\r?\n#{tag}\r?\n(Code: (\d+)\..*?)\r?\n\d+ #{tag}\r?\n__exception__/s
+  end
 
   defp maybe_put_private(conn, _k, nil), do: conn
   defp maybe_put_private(conn, k, v), do: HTTP.put_private(conn, k, v)

@@ -4,6 +4,7 @@
 
 - Emit `[:ch, :query, :start | :stop | :exception]` telemetry events for every query.
 - Query telemetry for a `Ch.stream/4` read stops after its last row; a `Ch.stream/4` insert is one query.
+- The stop event carries `:num_rows` and covers decoding the result.
 
 ## 0.9.3 (2026-10-15)
 

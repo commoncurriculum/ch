@@ -59,7 +59,7 @@ defmodule Ch.TelemetryTest do
            } = start_metadata
 
     assert database == Ch.Test.database()
-    assert stop_metadata == Map.put(start_metadata, :error, nil)
+    assert stop_metadata == Map.merge(start_metadata, %{error: nil, num_rows: 1})
   end
 
   test "the query's source option is in the metadata", %{conn: conn} do
@@ -92,7 +92,26 @@ defmodule Ch.TelemetryTest do
     assert_receive {:telemetry, [:ch, :query, :start], _, %{query: %Ch.Query{command: :insert}}}
 
     assert_receive {:telemetry, [:ch, :query, :stop], _,
-                    %{query: %Ch.Query{command: :insert}, error: nil}}
+                    %{query: %Ch.Query{command: :insert}, error: nil, num_rows: 2}}
+  end
+
+  test "a failed query reports no rows", %{conn: conn} do
+    assert {:error, _} = Ch.query(conn, "select ")
+    assert_receive {:telemetry, [:ch, :query, :stop], _, %{num_rows: nil}}
+  end
+
+  test "an undecoded query reports no rows", %{conn: conn} do
+    assert {:ok, _} = Ch.query(conn, "select 1", [], decode: false)
+    assert_receive {:telemetry, [:ch, :query, :stop], _, %{error: nil, num_rows: nil}}
+  end
+
+  test "a query that fails to decode emits exception instead of stop", %{conn: conn} do
+    assert_raise ArgumentError, fn -> Ch.query(conn, "select toIntervalDay(1)") end
+
+    assert_receive {:telemetry, [:ch, :query, :exception], _,
+                    %{kind: :error, reason: %ArgumentError{}}}
+
+    refute_received {:telemetry, [:ch, :query, :stop], _, _}
   end
 
   test "a stream stops only after its last row is fetched", %{conn: conn} do
@@ -113,7 +132,7 @@ defmodule Ch.TelemetryTest do
     assert_received {:telemetry, [:ch, :query, :start], _,
                      %{query: %Ch.Query{statement: ^statement}}}
 
-    assert_received {:telemetry, [:ch, :query, :stop], _, %{error: nil}}
+    assert_received {:telemetry, [:ch, :query, :stop], _, %{error: nil, num_rows: 5}}
     refute_received {:telemetry, [:ch, :query, _], _, _}
   end
 
@@ -153,7 +172,7 @@ defmodule Ch.TelemetryTest do
                      %{query: %Ch.Query{statement: ^statement}, source: "telemetry_stream_insert"}}
 
     assert_received {:telemetry, [:ch, :query, :stop], _,
-                     %{query: %Ch.Query{statement: ^statement}, error: nil}}
+                     %{query: %Ch.Query{statement: ^statement}, error: nil, num_rows: 3}}
 
     refute_received {:telemetry, [:ch, :query, _], _, _}
     assert %{rows: [[3]]} = Ch.query!(conn, "select count() from telemetry_stream_insert")

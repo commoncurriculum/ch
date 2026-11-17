@@ -136,19 +136,6 @@ defmodule Ch.TelemetryTest do
     refute_received {:telemetry, [:ch, :query, _], _, _}
   end
 
-  test "a stream stopped before its last row reports the closed connection on stop", %{
-    conn: conn
-  } do
-    DBConnection.run(conn, fn conn ->
-      conn
-      |> Ch.stream("select number from numbers(1000000) settings max_block_size = 1")
-      |> Enum.take(1)
-    end)
-
-    assert_receive {:telemetry, [:ch, :query, :stop], _, %{error: %Ch.Error{message: message}}}
-    assert message =~ "stopping stream before receiving full response"
-  end
-
   test "a streamed insert is one query that stops after its last chunk", %{conn: conn} do
     Ch.query!(conn, "create table telemetry_stream_insert(a UInt8) engine Memory")
     on_exit(fn -> Ch.Test.query("drop table telemetry_stream_insert") end)
@@ -212,6 +199,52 @@ defmodule Ch.TelemetryTest do
     end
 
     assert_receive {:telemetry, [:ch, :query, :stop], _, %{error: %Ch.Error{code: 62}}}
+  end
+
+  test "a stream stopped early stops without an error", %{conn: conn} do
+    DBConnection.run(conn, fn conn ->
+      conn
+      |> Ch.stream("select number from numbers(5000000) settings max_block_size=1000")
+      |> Enum.take(1)
+    end)
+
+    assert_receive {:telemetry, [:ch, :query, :stop], _, %{error: nil}}
+  end
+
+  test "a stream that is not decoded leaves its rows out", %{conn: conn} do
+    DBConnection.run(conn, fn conn ->
+      conn
+      |> Ch.stream("select number from numbers(10) format RowBinary", [], decode: false)
+      |> Stream.run()
+    end)
+
+    assert_receive {:telemetry, [:ch, :query, :stop], _, %{error: nil, num_rows: nil}}
+  end
+
+  test "a streamed insert whose source raises is not committed and stops with an error",
+       %{conn: conn} do
+    Ch.query!(conn, "create table telemetry_halted_insert(a UInt8) engine Memory")
+    on_exit(fn -> Ch.Test.query("drop table telemetry_halted_insert") end)
+    assert_receive {:telemetry, [:ch, :query, :stop], _, _}
+
+    assert_raise RuntimeError, "source failed", fn ->
+      DBConnection.run(conn, fn conn ->
+        stream =
+          Ch.stream(conn, "insert into telemetry_halted_insert(a) format RowBinary", [],
+            encode: false
+          )
+
+        [[1], [2], :fail]
+        |> Stream.map(fn
+          :fail -> raise "source failed"
+          row -> Ch.RowBinary.encode_row(row, ["UInt8"])
+        end)
+        |> Enum.into(stream)
+      end)
+    end
+
+    assert_receive {:telemetry, [:ch, :query, :stop], _, %{error: %Ch.Error{}}}
+    assert %{rows: [[0]]} = Ch.query!(conn, "select count() from telemetry_halted_insert")
   end
 
   def send_from_any_process(event, _measurements, metadata, test) do

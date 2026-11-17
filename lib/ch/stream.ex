@@ -36,8 +36,13 @@ defmodule Ch.Stream do
       stream
     end
 
-    defp collect(%{conn: conn, query: query, ref: ref}, eof) when eof in [:halt, :done] do
+    defp collect(%{conn: conn, query: query, ref: ref}, :done) do
       DBConnection.execute!(conn, query, {:stream, ref, :eof})
+    end
+
+    defp collect(%{conn: conn, query: query, ref: ref}, :halt) do
+      _ = DBConnection.execute(conn, query, {:stream, ref, :halt})
+      :ok
     end
   end
 end

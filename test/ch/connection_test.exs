@@ -1808,4 +1808,18 @@ defmodule Ch.ConnectionTest do
       assert List.last(row) == 1000
     end
   end
+
+  test "an error after the response started keeps ClickHouse's code, and the connection recovers",
+       ctx do
+    assert {:error, %Ch.Error{code: 395, message: message}} =
+             parameterize_query(
+               ctx,
+               "select throwIf(number = 50000, 'boom') from numbers(100000)",
+               [],
+               settings: [max_block_size: 100]
+             )
+
+    assert message =~ "boom"
+    assert {:ok, %{rows: [[1]]}} = parameterize_query(ctx, "select 1")
+  end
 end

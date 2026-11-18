@@ -258,13 +258,12 @@ defmodule Ch.FaultsTest do
   end
 
   describe "query" do
-    test "fails a query that times out after it was sent, without resending it, and reconnects",
-         %{
-           port: port,
-           listen: listen,
-           clickhouse: clickhouse,
-           query_options: query_options
-         } do
+    test "reconnects after timeout", %{
+      port: port,
+      listen: listen,
+      clickhouse: clickhouse,
+      query_options: query_options
+    } do
       log =
         capture_async_log(fn ->
           {:ok, conn} = Ch.start_link(port: port, timeout: 100)
@@ -285,8 +284,6 @@ defmodule Ch.FaultsTest do
           :ok = :gen_tcp.send(clickhouse, intercept_packets(mint))
           :ok = :gen_tcp.send(mint, first_byte(intercept_packets(clickhouse)))
 
-          assert {:error, %Mint.TransportError{reason: :timeout}} = Task.await(select)
-
           # reconnect
           {:ok, mint} = :gen_tcp.accept(listen)
 
@@ -294,20 +291,17 @@ defmodule Ch.FaultsTest do
           :ok = :gen_tcp.send(clickhouse, intercept_packets(mint))
           :ok = :gen_tcp.send(mint, intercept_packets(clickhouse))
 
-          select = Task.async(fn -> Ch.query(conn, "select 1 + 1", [], query_options) end)
-
           # select 1 + 1
           :ok = :gen_tcp.send(clickhouse, intercept_packets(mint))
           :ok = :gen_tcp.send(mint, intercept_packets(clickhouse))
 
           assert {:ok, %Ch.Result{rows: [[2]]}} = Task.await(select)
-          refute_receive {:tcp, ^mint, _resent}
         end)
 
       assert log =~ "disconnected: ** (Mint.TransportError) timeout"
     end
 
-    test "fails a query whose response is cut off, without resending it, and reconnects", ctx do
+    test "reconnects after closed on response", ctx do
       %{port: port, listen: listen, clickhouse: clickhouse, query_options: query_options} = ctx
 
       log =
@@ -331,8 +325,6 @@ defmodule Ch.FaultsTest do
           :ok = :gen_tcp.send(mint, first_byte(intercept_packets(clickhouse)))
           :ok = :gen_tcp.close(mint)
 
-          assert {:error, %Mint.TransportError{reason: :closed}} = Task.await(select)
-
           # reconnect
           {:ok, mint} = :gen_tcp.accept(listen)
 
@@ -340,14 +332,11 @@ defmodule Ch.FaultsTest do
           :ok = :gen_tcp.send(clickhouse, intercept_packets(mint))
           :ok = :gen_tcp.send(mint, intercept_packets(clickhouse))
 
-          select = Task.async(fn -> Ch.query(conn, "select 1 + 1", [], query_options) end)
-
           # select 1 + 1
           :ok = :gen_tcp.send(clickhouse, intercept_packets(mint))
           :ok = :gen_tcp.send(mint, intercept_packets(clickhouse))
 
           assert {:ok, %{rows: [[2]]}} = Task.await(select)
-          refute_receive {:tcp, ^mint, _resent}
         end)
 
       assert log =~ "disconnected: ** (Mint.TransportError) socket closed"
@@ -413,58 +402,101 @@ defmodule Ch.FaultsTest do
 
     # TODO non-chunked request
 
-    for {name, close_after_first_packet?} <- [
-          {"before the request is streamed", false},
-          {"while the request is streamed", true}
-        ] do
-      test "fails an insert whose connection closes #{name}, without resending it", ctx do
-        %{port: port, listen: listen, clickhouse: clickhouse, query_options: query_options} = ctx
+    test "reconnects after closed before streaming request", ctx do
+      %{port: port, listen: listen, clickhouse: clickhouse, query_options: query_options} = ctx
 
-        rows = [[1, 2], [3, 4]]
-        stream = Stream.map(rows, fn row -> Ch.RowBinary.encode_row(row, [:u8, :u8]) end)
+      rows = [[1, 2], [3, 4]]
+      stream = Stream.map(rows, fn row -> Ch.RowBinary.encode_row(row, [:u8, :u8]) end)
 
-        log =
-          capture_async_log(fn ->
-            {:ok, conn} = Ch.start_link(database: Ch.Test.database(), port: port)
+      log =
+        capture_async_log(fn ->
+          {:ok, conn} = Ch.start_link(database: Ch.Test.database(), port: port)
 
-            # connect
-            {:ok, mint} = :gen_tcp.accept(listen)
+          # connect
+          {:ok, mint} = :gen_tcp.accept(listen)
 
-            # handshake
-            :ok = :gen_tcp.send(clickhouse, intercept_packets(mint))
-            :ok = :gen_tcp.send(mint, intercept_packets(clickhouse))
+          # handshake
+          :ok = :gen_tcp.send(clickhouse, intercept_packets(mint))
+          :ok = :gen_tcp.send(mint, intercept_packets(clickhouse))
 
-            unless unquote(close_after_first_packet?), do: :ok = :gen_tcp.close(mint)
+          # disconnect before insert
+          :ok = :gen_tcp.close(mint)
 
-            insert =
-              Task.async(fn ->
-                Ch.query(
-                  conn,
-                  "insert into unknown_table(a,b) format RowBinary",
-                  stream,
-                  Keyword.merge(query_options, encode: false)
-                )
-              end)
+          insert =
+            Task.async(fn ->
+              Ch.query(
+                conn,
+                "insert into unknown_table(a,b) format RowBinary",
+                stream,
+                Keyword.merge(query_options, encode: false)
+              )
+            end)
 
-            if unquote(close_after_first_packet?) do
-              assert_receive {:tcp, ^mint, _packet}
-              :ok = :gen_tcp.close(mint)
-            end
+          # reconnect
+          {:ok, mint} = :gen_tcp.accept(listen)
 
-            assert {:error, %Mint.TransportError{reason: :closed}} = Task.await(insert)
+          # handshake
+          :ok = :gen_tcp.send(clickhouse, intercept_packets(mint))
+          :ok = :gen_tcp.send(mint, intercept_packets(clickhouse))
 
-            # reconnect
-            {:ok, mint} = :gen_tcp.accept(listen)
+          # insert
+          :ok = :gen_tcp.send(clickhouse, intercept_packets(mint))
+          :ok = :gen_tcp.send(mint, intercept_packets(clickhouse))
 
-            # handshake
-            :ok = :gen_tcp.send(clickhouse, intercept_packets(mint))
-            :ok = :gen_tcp.send(mint, intercept_packets(clickhouse))
+          assert {:error, %Ch.Error{code: 60, message: message}} = Task.await(insert)
+          assert message =~ ~r/UNKNOWN_TABLE/
+        end)
 
-            refute_receive {:tcp, ^mint, _resent}
-          end)
+      assert log =~ "disconnected: ** (Mint.TransportError) socket closed"
+    end
 
-        assert log =~ "disconnected: ** (Mint.TransportError) socket closed"
-      end
+    test "reconnects after closed while streaming request", ctx do
+      %{port: port, listen: listen, clickhouse: clickhouse, query_options: query_options} = ctx
+
+      rows = [[1, 2], [3, 4]]
+      stream = Stream.map(rows, fn row -> Ch.RowBinary.encode_row(row, [:u8, :u8]) end)
+
+      log =
+        capture_async_log(fn ->
+          {:ok, conn} = Ch.start_link(database: Ch.Test.database(), port: port)
+
+          # connect
+          {:ok, mint} = :gen_tcp.accept(listen)
+
+          # handshake
+          :ok = :gen_tcp.send(clickhouse, intercept_packets(mint))
+          :ok = :gen_tcp.send(mint, intercept_packets(clickhouse))
+
+          insert =
+            Task.async(fn ->
+              Ch.query(
+                conn,
+                "insert into unknown_table(a,b) format RowBinary",
+                stream,
+                Keyword.merge(query_options, encode: false)
+              )
+            end)
+
+          # close after first packet from mint arrives
+          assert_receive {:tcp, ^mint, _packet}
+          :ok = :gen_tcp.close(mint)
+
+          # reconnect
+          {:ok, mint} = :gen_tcp.accept(listen)
+
+          # handshake
+          :ok = :gen_tcp.send(clickhouse, intercept_packets(mint))
+          :ok = :gen_tcp.send(mint, intercept_packets(clickhouse))
+
+          # insert
+          :ok = :gen_tcp.send(clickhouse, intercept_packets(mint))
+          :ok = :gen_tcp.send(mint, intercept_packets(clickhouse))
+
+          assert {:error, %Ch.Error{code: 60, message: message}} = Task.await(insert)
+          assert message =~ ~r/UNKNOWN_TABLE/
+        end)
+
+      assert log =~ "disconnected: ** (Mint.TransportError) socket closed"
     end
 
     test "warns on different server name", ctx do

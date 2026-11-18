@@ -44,8 +44,8 @@ extra_exclude =
       [:time]
 
     true ->
-      # Time, Variant, JSON, and Dynamic types and the mid-response exception tag are not supported in older ClickHouse versions we have in the CI
-      [:time, :variant, :json, :dynamic, :exception_tag]
+      # Time, Variant, JSON, and Dynamic types are not supported in older ClickHouse versions we have in the CI
+      [:time, :variant, :json, :dynamic]
   end
 
 ExUnit.start(exclude: [:slow | extra_exclude])

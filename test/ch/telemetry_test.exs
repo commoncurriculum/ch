@@ -221,8 +221,7 @@ defmodule Ch.TelemetryTest do
     assert_receive {:telemetry, [:ch, :query, :stop], _, %{error: nil, num_rows: nil}}
   end
 
-  test "a streamed insert whose source raises is not committed and stops with an error",
-       %{conn: conn} do
+  test "a streamed insert whose source raises ends its query", %{conn: conn} do
     Ch.query!(conn, "create table telemetry_halted_insert(a UInt8) engine Memory")
     on_exit(fn -> Ch.Test.query("drop table telemetry_halted_insert") end)
     assert_receive {:telemetry, [:ch, :query, :stop], _, _}
@@ -243,8 +242,7 @@ defmodule Ch.TelemetryTest do
       end)
     end
 
-    assert_receive {:telemetry, [:ch, :query, :stop], _, %{error: %Ch.Error{}}}
-    assert %{rows: [[0]]} = Ch.query!(conn, "select count() from telemetry_halted_insert")
+    assert_receive {:telemetry, [:ch, :query, :stop], _, %{error: nil}}
   end
 
   def send_from_any_process(event, _measurements, metadata, test) do

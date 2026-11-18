@@ -1809,6 +1809,7 @@ defmodule Ch.ConnectionTest do
     end
   end
 
+  @tag :exception_tag
   test "an error after the response started keeps ClickHouse's code, and the connection recovers",
        ctx do
     assert {:error, %Ch.Error{code: 395, message: message}} =

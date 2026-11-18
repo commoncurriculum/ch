@@ -5,6 +5,8 @@
 - Emit `[:ch, :query, :start | :stop | :exception]` telemetry events for every query.
 - Query telemetry for a `Ch.stream/4` read stops after its last row; a `Ch.stream/4` insert is one query.
 - The stop event carries `:num_rows` and covers decoding the result.
+- An insert `Ch.stream/4` whose source raises before its last chunk closes the connection, so ClickHouse commits none of it, and its query stops with a `%Ch.Error{}`.
+- A query whose caller is killed while it runs emits no stop event: the connection process cannot see it. A stream whose caller times out is stopped by the pool when it disconnects.
 
 ## 0.9.3 (2026-10-15)
 

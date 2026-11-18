@@ -207,6 +207,8 @@ Every query, from `Ch.query/4`, `Ch.stream/4` or Ecto, emits `[:ch, :query, :sta
 
 Metadata: `:query` (the `%Ch.Query{}`), `:database`, `:hostname`, `:port` and `:source`, the query's `:source` option, which Ecto sets to the table. The stop event adds `:error`, the `%Ch.Error{}` or transport error the query returned, or `nil`, and `:num_rows`: the rows decoded for a read, or the rows ClickHouse reports written for an insert, or `nil` when there are none to count. A query stops after its result is decoded.
 
+A query whose caller is killed while the query runs emits no stop event, because only the caller holds it. A `Ch.stream/4` that the pool disconnects, for example after a checkout timeout, is stopped by the connection process with the error.
+
 A `Ch.stream/4` read stops after its last row is fetched, or, without an error, when the stream is stopped early; a read with `decode: false` has no `:num_rows`. A `Ch.stream/4` insert (used as a collectable) is one query that stops after its last chunk. If its source raises, the insert is abandoned by closing the connection, so nothing is written, and it stops with a `%Ch.Error{}`.
 
 ## Caveats

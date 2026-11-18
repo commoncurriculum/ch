@@ -247,10 +247,8 @@ defimpl DBConnection.Query, for: Ch.Query do
     |> format_row_binary?()
   end
 
-  def decode(query, {Ch.Telemetry, telemetry, responses}, opts) do
-    result = Ch.Telemetry.run(telemetry, fn -> decode(query, responses, opts) end)
-    Ch.Telemetry.stop(Ch.Telemetry.add_rows(telemetry, result.num_rows), nil)
-    result
+  def decode(query, %Ch.Telemetry.Reply{} = reply, opts) do
+    Ch.Telemetry.decode(reply, &decode(query, &1, opts))
   end
 
   # stream: select result

@@ -124,16 +124,9 @@ defmodule Ch.Connection do
 
   @impl true
   def handle_declare(query, params, opts, conn) do
-    telemetry = telemetry_start(query, opts, conn)
-
-    case Telemetry.run(telemetry, fn -> declare(query, params, opts, conn) end) do
-      {:ok, query, result, {conn, reader}} ->
-        {:ok, query, result, {HTTP.put_private(conn, :telemetry, telemetry), reader}}
-
-      {_error, reason, _conn} = error ->
-        Telemetry.stop(telemetry, reason)
-        error
-    end
+    conn
+    |> telemetry_start(query, opts)
+    |> traced(&declare(query, params, opts, &1))
   end
 
   defp declare(query, params, opts, conn) do
@@ -245,18 +238,13 @@ defmodule Ch.Connection do
   defp maybe_concat_buffer([], data), do: data
 
   @impl true
-  def handle_fetch(query, %Result{} = result, opts, {conn, _reader} = state) do
-    case Telemetry.run(HTTP.get_private(conn, :telemetry), fn ->
-           fetch(query, result, opts, state)
-         end) do
+  def handle_fetch(query, %Result{} = result, opts, {conn, reader}) do
+    case traced(conn, &fetch(query, result, opts, {&1, reader})) do
       {:cont, result, {conn, %{decode: false} = reader}} ->
         {:cont, result, {conn, reader}}
 
       {:cont, %Result{num_rows: num_rows} = result, {conn, reader}} ->
         {:cont, result, {telemetry_add_rows(conn, num_rows), reader}}
-
-      {:disconnect, reason, conn} ->
-        {:disconnect, reason, telemetry_finish(conn, reason)}
 
       other ->
         other
@@ -325,16 +313,9 @@ defmodule Ch.Connection do
 
   @impl true
   def handle_execute(query, {:stream, _params} = params, opts, conn) do
-    telemetry = telemetry_start(query, opts, conn)
-
-    case Telemetry.run(telemetry, fn -> execute(query, params, opts, conn) end) do
-      {:ok, query, ref, conn} ->
-        {:ok, query, ref, HTTP.put_private(conn, :telemetry, telemetry)}
-
-      {_error, reason, _conn} = error ->
-        Telemetry.stop(telemetry, reason)
-        error
-    end
+    conn
+    |> telemetry_start(query, opts)
+    |> traced(&execute(query, params, opts, &1))
   end
 
   def handle_execute(_query, {:stream, _ref, :halt}, _opts, conn) do
@@ -342,43 +323,52 @@ defmodule Ch.Connection do
     {:disconnect, error, telemetry_finish(conn, error)}
   end
 
-  def handle_execute(query, {:stream, _ref, body} = params, opts, conn) do
-    telemetry = HTTP.get_private(conn, :telemetry)
+  def handle_execute(query, {:stream, _ref, :eof} = params, opts, conn) do
+    conn
+    |> traced(&execute(query, params, opts, &1))
+    |> reply_for_decode()
+  end
 
-    case Telemetry.run(telemetry, fn -> execute(query, params, opts, conn) end) do
-      {:ok, query, responses, conn} when body == :eof ->
-        {:ok, query, {Telemetry, telemetry, responses}, HTTP.delete_private(conn, :telemetry)}
-
-      {:ok, _query, _ref, _conn} = ok ->
-        ok
-
-      {error, reason, conn} ->
-        {error, reason, telemetry_finish(conn, reason)}
-    end
+  def handle_execute(query, {:stream, _ref, _chunk} = params, opts, conn) do
+    traced(conn, &execute(query, params, opts, &1))
   end
 
   def handle_execute(query, params, opts, conn) do
-    telemetry = telemetry_start(query, opts, conn)
+    conn
+    |> telemetry_start(query, opts)
+    |> traced(&execute(query, params, opts, &1))
+    |> reply_for_decode()
+  end
 
-    case Telemetry.run(telemetry, fn -> execute(query, params, opts, conn) end) do
-      {:ok, query, responses, conn} ->
-        {:ok, query, {Telemetry, telemetry, responses}, conn}
+  defp telemetry_start(conn, query, opts) do
+    telemetry =
+      Telemetry.start(%{
+        query: query,
+        database: get_opts_or_private(conn, opts, :database),
+        hostname: HTTP.get_private(conn, :hostname),
+        port: HTTP.get_private(conn, :port),
+        source: Keyword.get(opts, :source)
+      })
 
-      {_error, reason, _conn} = error ->
-        Telemetry.stop(telemetry, reason)
-        error
+    HTTP.put_private(conn, :telemetry, telemetry)
+  end
+
+  defp traced(conn, fun) do
+    case Telemetry.run(HTTP.get_private(conn, :telemetry), fn -> fun.(conn) end) do
+      {failure, reason, conn} when failure in [:error, :disconnect, :disconnect_and_retry] ->
+        {failure, reason, telemetry_finish(conn, reason)}
+
+      result ->
+        result
     end
   end
 
-  defp telemetry_start(query, opts, conn) do
-    Telemetry.start(%{
-      query: query,
-      database: get_opts_or_private(conn, opts, :database),
-      hostname: HTTP.get_private(conn, :hostname),
-      port: HTTP.get_private(conn, :port),
-      source: Keyword.get(opts, :source)
-    })
+  defp reply_for_decode({:ok, query, responses, conn}) do
+    reply = %Telemetry.Reply{telemetry: HTTP.get_private(conn, :telemetry), responses: responses}
+    {:ok, query, reply, HTTP.delete_private(conn, :telemetry)}
   end
+
+  defp reply_for_decode(failure), do: failure
 
   defp telemetry_add_rows(conn, num_rows) do
     telemetry = HTTP.get_private(conn, :telemetry)
